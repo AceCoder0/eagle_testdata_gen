@@ -1,45 +1,115 @@
-create_dataset.py 使用方式：
-1、merged_dataset.jsonl放到指定目录下（建议跟create_dataset.py同目录）
-2、pip install matplotlib scipy numpy langid tqdm
-3、python create_dataset.py --input_len 【输入token数】 --variance_scale 【方差（0~inf，默认为0无随机，1为标准正态分布）】 --max_lines 【产生数据条数】--min_length 【最小token长度】--max_length 【最大token长度】
-                                            --distribution 【'{"input长度1": 比例1, "input长度2": 比例2, ...}' (比例总和1.0)，注意前后加单引号(')】（设置distribution参数后，自动忽略-input_len和--variance_scale）
-                                            --input_filename 【输入数据集路径】 --output_filename 【输出数据集路径】
-示例：python create_dataset.py --input_len 512 --variance_scale 1 --max_lines 100 --min_length 64 --max_length 1024 --input_filename "/data/merged_dataset.jsonl" --output_filename "/data/test_dataset.jsonl" （生成100条均值512，标准正态分布的数据，最小长度64，最大长度1024，指定输入输出路径）
-          python create_dataset.py --input_len 1024 --variance_scale 0 --max_lines 300 （生成300条长度最接近1024的数据，其他默认：最小最大长度不限，输入路径"./merged_dataset.jsonl"，输出路径"./test_dataset.jsonl"）
-          python create_dataset.py --max_lines 500 --min_length 512 --max_length 3584 --distribution '{"1024": 0.3, "2048": 0.7}' （生成500条数据，500*30%条长度1024, 500*70%条长度2048，最小长度512，最大长度3584）
-          python create_dataset.py --input_len 512 --variance_scale 1 --max_lines 500 --distribution '{"1024": 0.3, "2048": 0.7}' （生成500条数据，500*30%条长度1024, 500*70%条长度2048，最小最大长度不限，自动忽略-input_len和--variance_scale）
+eagle_testdata_gen -- 数学数据集性能测试用例生成工具
+========================================================
 
-data_augment.py 使用方式：
-1、确保DeepSeekR1文件夹跟data_augment.py同目录
-2、pip install matplotlib scipy numpy langid tqdm jionlp transformers
-3、python data_augment.py --aug_scale 【数据扩充倍数】--min_length 【最小token长度】--max_length 【最大token长度】--input_filename 【输入数据集路径】 --output_filename 【输出数据集路径】
-示例：python data_augment.py  --aug_scale 10 --input_filename "./test_dataset.jsonl" --output_filename "./test_dataset_aug.jsonl" （数据扩充10倍）
-          python data_augment.py  --aug_scale 10 --min_length 512 --max_length 3584 （数据扩充10倍，最小长度512，最大长度3584，其他默认：输入路径"./test_dataset.jsonl"，输出路径"./test_dataset_aug.jsonl"）
+从 AISBench 开源数学数据集中抽取/构造固定输入长度的测试用例，
+用于 LLM 推理性能压测。
 
-shuffle.py 使用方式：
-1、python shuffle.py  --input_filename 【输入数据集路径】 --output_filename 【输出数据集路径】
-示例：python shuffle.py  --input_filename "./test_dataset.jsonl" --output_filename "./test_dataset_shuffle.jsonl"
+支持的目标输入长度：3.5k, 16k, 32k, 64k, 200k tokens
 
-data_dist.py 使用方式：
-1、pip install matplotlib scipy numpy langid
-2、python data_dist.py --input_filename 【输入数据集路径】 --output_filename 【输出分布图路径】
-示例：python data_dist.py  --input_filename "./test_dataset.jsonl" --output_filename "./test_dataset.png"
+数据来源：AISBench 开源数据集表格中的数学推理类数据集
+  - gsm8k (openai/gsm8k)
+  - math (lighteval/MATH)
+  - aime2024 / aime2025 / aime2026
+  - mgsm (juletxara/mgsm)
+  - dapo-math-17k (open-r1/DAPO-Math-17k)
 
-更新记录：
-v1.3
-data_augment.py 性能优化，新增设置最小最大token长度，自动将数据随机洗牌保存，输出输出token长度分布与语种分布
-data_dist.py 能力增强，自动输出token长度分布与语种分布
 
-v1.2
-reate_dataset.py 新增设置最小最大token长度
-自带DeepSeekR1分词器，无需联网下载
-新增统计数据分布能力，见data_dist.py
-数据扩充能力增强，可设置扩充倍数
+===== 使用方式 =====
 
-v1.1
-新增数据扩充能力，通过邻近汉字换位/同音词替换/随机增删字符扩充数据集，见data_augment.py
-新增数据集随机洗牌能力，见shuffle.py
-create_dataset.py 完成数据筛选后，自动将数据随机洗牌保存
+1. 安装依赖
+   pip install transformers datasets tqdm langid matplotlib scipy numpy
 
-v1.0
-初始版本
+2. 下载数据集（一次性，需要网络）
+   python download_datasets.py --output_pool math_pool.jsonl
+   
+   可选参数：
+     --tokenizer_path ./DeepSeekR1   # 分词器路径
+     --skip gsm8k,aime2024           # 跳过某些数据集
+
+3. 构造测试用例
+   python build_testdata.py \
+       --pool math_pool.jsonl \
+       --targets 3500,16000,32000,64000,200000 \
+       --samples 100 \
+       --tolerance 0.05 \
+       --output_dir ./output/
+
+   参数说明：
+     --pool          步骤2产生的数据池
+     --targets       目标输入长度（tokens），逗号分隔
+     --samples       每个长度生成多少条（默认100）
+     --tolerance     允许偏差比例（默认0.05 = ±5%）
+     --min_qa_pairs  最少 few-shot 示例数（默认2）
+     --output_dir    输出目录
+     --seed          随机种子（默认42）
+
+4. 查看分布
+   python data_dist.py --input_filename ./output/testdata_16k.jsonl
+
+5. 随机打乱
+   python shuffle.py --input_filename ./output/testdata_16k.jsonl \
+                     --output_filename ./output/testdata_16k_shuffle.jsonl
+
+
+===== 构造策略 =====
+
+短输入（3.5k）：少量 Q&A 示例 + 最终问题即可达到目标长度。
+长输入（16k, 32k, 64k, 200k）：使用 few-shot 方式，将多条 Q&A
+  示例拼接在一起，组成一个长 prompt，最后一个问题作为模型需要
+  回答的"最终问题"。
+
+Few-shot prompt 格式：
+  Solve the following math problems. Show your step-by-step reasoning.
+
+  Q: {question_1}
+  A: {answer_1}
+
+  Q: {question_2}
+  A: {answer_2}
+
+  ...
+
+  Q: {final_question}
+  A:
+
+多样性保证：
+  - 全局去重：移除完全相同的题目
+  - 跨样本去重：每个长度下最终问题不重复
+  - 样本内去重：同一个 prompt 内不出现重复的 Q&A
+  - 分层采样：尽量从不同数据集选取示例
+
+
+===== 输出格式 =====
+
+JSONL 文件，每行一个 JSON 对象：
+  {
+    "question": "<完整的 few-shot prompt>",
+    "question_token_len": 16234,
+    "final_question": "<模型需要回答的问题>",
+    "source": "fewshot_45_exemplars",
+    "num_exemplars": 45,
+    "target_tokens": 16000
+  }
+
+与 AISBench 开源数据集格式兼容（question + question_token_len 字段）。
+
+
+===== 其他工具 =====
+
+create_dataset.py / data_augment.py -- 旧版工具（v1.x），
+  用于从 merged_dataset.jsonl 中按长度筛选+中文增强。
+  新版建议使用 build_testdata.py + download_datasets.py。
+
+
+===== 更新记录 =====
+
+v2.0
+  - 新增 download_datasets.py：从 HuggingFace 下载 AISBench 数学数据集
+  - 新增 build_testdata.py：基于 few-shot 构造指定长度的测试用例
+  - 新增 fewshot.py：few-shot prompt 构造算法
+  - 新增 dedup.py：去重工具
+  - 支持 200k tokens 长序列
+  - 数据来源从通用文本迁移到开源数学数据集
+
+v1.3 - v1.0
+  见旧版 readme

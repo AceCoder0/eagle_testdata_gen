@@ -1,0 +1,5 @@
+math_pool.jsonl
+output/
+*.png
+__pycache__/
+*.pyc

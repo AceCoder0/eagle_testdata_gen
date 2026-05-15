@@ -42,7 +42,7 @@ class FewShotBuilder:
     def __init__(self, pool: List[Dict], tokenizer, seed: int = 42):
         self.pool = pool
         self.tokenizer = tokenizer
-        random.seed(seed)
+        self.rng = random.Random(seed)
 
         # Pre-compute formatted token counts for each pool entry
         self._qa_tokens: Dict[str, int] = {}
@@ -72,16 +72,16 @@ class FewShotBuilder:
         if not available_sources:
             available_sources = list(self._by_source.keys())
 
-        random.shuffle(available_sources)
+        self.rng.shuffle(available_sources)
         for src in available_sources:
             candidates = [r for r in self._by_source[src] if r["id"] not in used_ids]
             if candidates:
-                return random.choice(candidates)
+                return self.rng.choice(candidates)
 
         # Fallback: any unused record
         candidates = [r for r in self.pool if r["id"] not in used_ids]
         if candidates:
-            return random.choice(candidates)
+            return self.rng.choice(candidates)
         return None
 
     def build_one(
@@ -115,7 +115,7 @@ class FewShotBuilder:
             used_final_qs.clear()
             available_final = list(self.pool)
 
-        final_qa = random.choice(available_final)
+        final_qa = self.rng.choice(available_final)
         used_final_qs.add(final_qa["id"])
 
         final_q_formatted = FINAL_Q_TEMPLATE.format(question=final_qa["question"])
@@ -151,7 +151,7 @@ class FewShotBuilder:
             candidates = [r for r in self.pool if r["id"] not in used_in_prompt]
             if not candidates:
                 break
-            c = random.choice(candidates)
+            c = self.rng.choice(candidates)
             qa_tok = self._qa_tokens[c["id"]]
             exemplars.append((c, qa_tok))
             budget -= qa_tok
@@ -174,7 +174,7 @@ class FewShotBuilder:
                         break
 
         # Assemble the prompt
-        random.shuffle(exemplars)
+        self.rng.shuffle(exemplars)
         parts = [INSTRUCTION]
         for rec, _ in exemplars:
             parts.append(
@@ -328,8 +328,7 @@ class FewShotBuilder:
         common_text_tokens = _format_count(common_text, self.tokenizer)
 
         # ---- Phase 2: Build unique suffix per sample ----
-        import uuid
-        batch_id = uuid.uuid4().hex[:8]
+        batch_id = ''.join(self.rng.choices('0123456789abcdef', k=8))
         results: List[Dict] = []
         used_final_qs: Set[str] = set()
 
@@ -340,7 +339,7 @@ class FewShotBuilder:
                 used_final_qs.clear()
                 available_final = list(self.pool)
 
-            final_qa = random.choice(available_final)
+            final_qa = self.rng.choice(available_final)
             used_final_qs.add(final_qa["id"])
 
             final_q_formatted = FINAL_Q_TEMPLATE.format(question=final_qa["question"])
@@ -362,12 +361,12 @@ class FewShotBuilder:
                 ]
                 if not candidates:
                     break
-                c = random.choice(candidates)
+                c = self.rng.choice(candidates)
                 qa_tok = self._qa_tokens[c["id"]]
                 unique_exemplars.append((c, qa_tok))
                 exclude.add(c["id"])
 
-            random.shuffle(unique_exemplars)
+            self.rng.shuffle(unique_exemplars)
             unique_text = self._exemplars_to_text(unique_exemplars)
 
             # Assemble full prompt

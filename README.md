@@ -32,10 +32,16 @@ pip install transformers datasets tqdm langid matplotlib scipy numpy
 ### 第一步：下载数据集（一次性，需要网络）
 
 ```bash
+# 方式一：从 HuggingFace 下载（默认）
 python download_datasets.py --output_pool math_pool.jsonl
+
+# 方式二：从 OpenCompass 下载（国内服务器友好，无需 HuggingFace 访问）
+python download_datasets.py --source opencompass --output_pool math_pool.jsonl
 ```
 
 下载后产生 `math_pool.jsonl`，约 26,000+ 条 Q&A 对，每条包含 `question`、`answer`、`question_tokens`、`answer_tokens` 等字段。
+
+> **注意**：`mgsm` 和 `dapo_math_17k` 暂无 OpenCompass 镜像，使用 `--source opencompass` 时会自动跳过。
 
 ### 第二步：构造测试用例
 
@@ -240,11 +246,20 @@ Actual hit rate:   60.0% of tokens are shared
 
 ### `download_datasets.py`
 
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--output_pool` | `math_pool.jsonl` | 输出 JSONL 文件路径 |
+| `--source` | `huggingface` | 下载源：`huggingface` 或 `opencompass`（国内服务器推荐） |
+| `--tokenizer_path` | `./DeepSeekR1` | DeepSeekR1 tokenizer 路径 |
+| `--skip` | (空) | 跳过指定数据集，逗号分隔，如 `gsm8k_test,aime2025` |
+| `--seed` | `42` | 随机种子，保证可复现 |
+
 ```bash
-python download_datasets.py \
-    --output_pool math_pool.jsonl \
-    --tokenizer_path ./DeepSeekR1 \
-    --skip gsm8k_test,aime2025    # 跳过某些数据集
+# 默认 HuggingFace 下载
+python download_datasets.py --output_pool math_pool.jsonl
+
+# OpenCompass 下载（适合国内服务器 / 无法访问 HuggingFace 的环境）
+python download_datasets.py --source opencompass --output_pool math_pool.jsonl
 ```
 
 ### `build_testdata.py`
@@ -274,6 +289,22 @@ python shuffle.py --input_filename output/testdata_32k.jsonl \
 ## 旧版工具 (v1.x)
 
 `create_dataset.py` 和 `data_augment.py` 仍保留在仓库中。旧版从通用文本中按长度筛选，使用中文同音替换/字符换位做增强。新版 (`build_testdata.py`) 建议替代旧版使用。
+
+## 更新日志
+
+### 2026-05-15
+
+- **OpenCompass 下载源**：新增 `--source opencompass`，从阿里云 OSS 镜像下载数据集，解决国内服务器无法访问 HuggingFace 的问题。支持 GSM8K、MATH-500、AIME 2024/2025。`mgsm` 和 `dapo_math_17k` 暂无镜像会自动跳过
+- **种子复现**：`download_datasets.py` 新增 `--seed` 参数；`FewShotBuilder` 使用实例级独立 RNG，同一参数保证输出完全一致
+
+### 2026-05-14
+
+- **测试套件**：新增 `test_eagle.py`，36 个测试覆盖去重、few-shot 构建、prefix cache、shuffle、数据池加载、token 计数、复现性
+- **Prefix Cache 测试**：新增 `--prefix_rate` 参数（0~1），支持生成带共同前缀的测试数据，用于评估 KV cache 命中率
+
+### 2026-05-13
+
+- **v2.0 重写**：从 AISBench 开源数学数据集下载 7 个数据源（GSM8K、MATH-500、AIME 2024/2025、MGSM、DAPO-Math-17k），通过 few-shot Q&A 拼接构造固定长度性能测试用例，支持 3.5k / 16k / 32k / 64k / 200k tokens
 
 ## License
 

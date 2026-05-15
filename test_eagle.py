@@ -381,3 +381,58 @@ class TestTokenCounting:
             formatted = QA_TEMPLATE.format(question=r["question"], answer=r["answer"])
             expected = _format_count(formatted, tokenizer)
             assert builder._qa_tokens[r["id"]] == expected
+
+
+# ---------------------------------------------------------------------------
+# reproducibility tests
+# ---------------------------------------------------------------------------
+
+class TestReproducibility:
+    def test_same_seed_build_many_identical(self, synthetic_pool, tokenizer):
+        """Same seed + same pool → identical output from build_many."""
+        b1 = FewShotBuilder(synthetic_pool, tokenizer, seed=42)
+        b2 = FewShotBuilder(synthetic_pool, tokenizer, seed=42)
+        r1 = b1.build_many(target_tokens=2000, num_samples=5, tolerance=0.10)
+        r2 = b2.build_many(target_tokens=2000, num_samples=5, tolerance=0.10)
+        for a, b in zip(r1, r2):
+            assert a["question"] == b["question"]
+            assert a["question_token_len"] == b["question_token_len"]
+            assert a["final_question"] == b["final_question"]
+
+    def test_different_seed_different_output(self, synthetic_pool, tokenizer):
+        """Different seeds should produce different prompts."""
+        b1 = FewShotBuilder(synthetic_pool, tokenizer, seed=42)
+        b2 = FewShotBuilder(synthetic_pool, tokenizer, seed=99)
+        r1 = b1.build_many(target_tokens=2000, num_samples=5, tolerance=0.10)
+        r2 = b2.build_many(target_tokens=2000, num_samples=5, tolerance=0.10)
+        any_diff = any(
+            r1[i]["question"] != r2[i]["question"] for i in range(5)
+        )
+        assert any_diff, "Different seeds should produce different output"
+
+    def test_prefix_batch_reproducible(self, synthetic_pool, tokenizer):
+        """Same seed → same batch_id and identical prompts in prefix mode."""
+        b1 = FewShotBuilder(synthetic_pool, tokenizer, seed=42)
+        b2 = FewShotBuilder(synthetic_pool, tokenizer, seed=42)
+        r1 = b1.build_prefix_batch(
+            target_tokens=3000, num_samples=3, prefix_rate=0.5, tolerance=0.10
+        )
+        r2 = b2.build_prefix_batch(
+            target_tokens=3000, num_samples=3, prefix_rate=0.5, tolerance=0.10
+        )
+        assert r1[0]["batch_id"] == r2[0]["batch_id"]
+        for a, b in zip(r1, r2):
+            assert a["question"] == b["question"]
+            assert a["question_token_len"] == b["question_token_len"]
+
+    def test_different_seed_different_batch_id(self, synthetic_pool, tokenizer):
+        """Different seeds → different batch_ids."""
+        b1 = FewShotBuilder(synthetic_pool, tokenizer, seed=42)
+        b2 = FewShotBuilder(synthetic_pool, tokenizer, seed=99)
+        r1 = b1.build_prefix_batch(
+            target_tokens=3000, num_samples=3, prefix_rate=0.5, tolerance=0.10
+        )
+        r2 = b2.build_prefix_batch(
+            target_tokens=3000, num_samples=3, prefix_rate=0.5, tolerance=0.10
+        )
+        assert r1[0]["batch_id"] != r2[0]["batch_id"]

@@ -6,6 +6,7 @@ Outputs math_pool.jsonl with fields: id, question, answer, source, question_toke
 """
 import os
 import json
+import random
 import argparse
 import hashlib
 from tqdm import tqdm
@@ -202,7 +203,11 @@ def main():
                         help="Path to DeepSeekR1 tokenizer directory")
     parser.add_argument("--skip", type=str, default="",
                         help="Comma-separated dataset names to skip")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducibility")
     args = parser.parse_args()
+
+    random.seed(args.seed)
 
     tokenizer_path = os.path.abspath(args.tokenizer_path)
     print(f"Loading tokenizer from {tokenizer_path}")
@@ -223,6 +228,9 @@ def main():
         print(f"\n[{name}] Downloading...")
         records = download_dataset(config, tokenizer, seen_hashes)
         all_records.extend(records)
+
+    # Sort by id for deterministic output
+    all_records.sort(key=lambda r: r["id"])
 
     # Save pool
     output_path = os.path.abspath(args.output_pool)

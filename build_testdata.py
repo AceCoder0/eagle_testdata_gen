@@ -8,12 +8,20 @@ Usage:
   # Step 1: Download datasets (one-time)
   python download_datasets.py --output_pool math_pool.jsonl
 
-  # Step 2: Build test cases
-  python build_testdata.py \
-      --pool math_pool.jsonl \
-      --targets 3500,16000,32000,64000,200000 \
-      --samples 100 \
-      --tolerance 0.05 \
+  # Step 2: Build test cases (independent samples)
+  python build_testdata.py \\
+      --pool math_pool.jsonl \\
+      --targets 3500,16000,32000,64000,200000 \\
+      --samples 100 \\
+      --tolerance 0.05 \\
+      --output_dir ./output/
+
+  # Step 3: Build test cases WITH prefix cache hit rate control
+  python build_testdata.py \\
+      --pool math_pool.jsonl \\
+      --targets 32000 \\
+      --samples 500 \\
+      --prefix_rate 0.6 \\
       --output_dir ./output/
 """
 import os
@@ -39,6 +47,11 @@ def main():
                         help="Acceptable fractional deviation from target (e.g., 0.05 = +/-5%%)")
     parser.add_argument("--min_qa_pairs", type=int, default=2,
                         help="Minimum exemplar Q&A pairs in few-shot prompt")
+    parser.add_argument("--prefix_rate", type=float, default=0.0,
+                        help="Prefix cache hit rate [0, 1]. 0=independent samples, "
+                             "0.6=60%% shared prefix across all samples in the batch, "
+                             "0.9=90%% shared. All samples in one batch share the same "
+                             "common prefix (same Q&A pairs in same order).")
     parser.add_argument("--tokenizer_path", type=str, default="./DeepSeekR1",
                         help="Path to tokenizer directory")
     parser.add_argument("--output_dir", type=str, default="./output",
@@ -46,6 +59,9 @@ def main():
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility")
     args = parser.parse_args()
+
+    if not 0.0 <= args.prefix_rate <= 1.0:
+        parser.error("--prefix_rate must be in [0, 1]")
 
     random.seed(args.seed)
 
@@ -86,22 +102,43 @@ def main():
     # Initialize few-shot builder
     builder = FewShotBuilder(pool, tokenizer, seed=args.seed)
 
+    use_prefix = args.prefix_rate > 0.0
+
     # Generate test cases for each target length
     for target in targets:
         label = f"{target // 1000}k" if target >= 1000 else str(target)
-        output_file = os.path.join(output_dir, f"testdata_{label}.jsonl")
+
+        if use_prefix:
+            pr_label = f"p{str(args.prefix_rate).replace('.', '_')}"
+            output_file = os.path.join(output_dir, f"testdata_{label}_{pr_label}.jsonl")
+        else:
+            output_file = os.path.join(output_dir, f"testdata_{label}.jsonl")
 
         print(f"\n{'='*50}")
         print(f"Target: {target:,} tokens ({args.samples} samples)")
+        if use_prefix:
+            common_len = int(target * args.prefix_rate)
+            unique_len = target - common_len
+            print(f"  Prefix rate: {args.prefix_rate} "
+                  f"(common prefix ~{common_len:,} tokens, unique suffix ~{unique_len:,} tokens)")
         print(f"  Tolerance: +/-{args.tolerance * 100:.0f}% "
               f"[{int(target * (1 - args.tolerance)):,}, {int(target * (1 + args.tolerance)):,}]")
 
-        records = builder.build_many(
-            target_tokens=target,
-            num_samples=args.samples,
-            tolerance=args.tolerance,
-            min_qa_pairs=args.min_qa_pairs,
-        )
+        if use_prefix:
+            records = builder.build_prefix_batch(
+                target_tokens=target,
+                num_samples=args.samples,
+                prefix_rate=args.prefix_rate,
+                tolerance=args.tolerance,
+                min_qa_pairs=args.min_qa_pairs,
+            )
+        else:
+            records = builder.build_many(
+                target_tokens=target,
+                num_samples=args.samples,
+                tolerance=args.tolerance,
+                min_qa_pairs=args.min_qa_pairs,
+            )
 
         # Write output
         with open(output_file, "w", encoding="utf-8") as f:
@@ -119,7 +156,27 @@ def main():
             print(f"  Length range: {min(lengths):,} - {max(lengths):,}")
             print(f"  Length mean: {sum(lengths) // len(lengths):,}")
             print(f"  Within tolerance: {within_tol}/{len(records)}")
-            print(f"  Avg exemplars: {sum(r.get('num_exemplars', 0) for r in records) // len(records)}")
+            if use_prefix:
+                common_avg = sum(r.get("common_exemplars", 0) for r in records) // max(len(records), 1)
+                unique_avg = sum(r.get("unique_exemplars", 0) for r in records) // max(len(records), 1)
+                print(f"  Avg common exemplars: {common_avg}")
+                print(f"  Avg unique exemplars: {unique_avg}")
+                # Verify the common prefix is indeed identical across samples
+                first_q = records[0]["question"]
+                prefix_len = 0
+                for r in records[1:]:
+                    # Find the divergence point
+                    q = r["question"]
+                    i = 0
+                    while i < min(len(first_q), len(q)) and first_q[i] == q[i]:
+                        i += 1
+                    if prefix_len == 0:
+                        prefix_len = i
+                    else:
+                        prefix_len = min(prefix_len, i)
+                print(f"  Verified common prefix: {prefix_len:,} chars identical across all samples")
+            else:
+                print(f"  Avg exemplars: {sum(r.get('num_exemplars', 0) for r in records) // len(records)}")
             print(f"  Output: {output_file}")
         else:
             print(f"  FAILED: No samples generated for target={target}")
@@ -130,7 +187,8 @@ def main():
         if f.endswith(".jsonl"):
             path = os.path.join(output_dir, f)
             count = sum(1 for _ in open(path, "r", encoding="utf-8"))
-            print(f"  {f}: {count} records")
+            size_mb = os.path.getsize(path) / (1024 * 1024)
+            print(f"  {f}: {count} records ({size_mb:.1f} MB)")
 
 
 if __name__ == "__main__":

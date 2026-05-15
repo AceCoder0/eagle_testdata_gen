@@ -220,3 +220,175 @@ class FewShotBuilder:
         results = cross_prompt_dedup(results, key="final_question")
 
         return results
+
+    # ------------------------------------------------------------------
+    # Prefix-cache-aware batch builder
+    # ------------------------------------------------------------------
+
+    def _fill_exemplars(
+        self,
+        budget: int,
+        exclude_ids: Set[str],
+        tolerance: float,
+        target_tokens: int,
+    ) -> Tuple[List[Tuple[Dict, int]], int]:
+        """Greedy fill exemplar Q&A pairs up to budget tokens.
+        Returns (list of (record, qa_tokens), remaining_budget).
+        """
+        exemplars: List[Tuple[Dict, int]] = []
+        used: Set[str] = set(exclude_ids)
+        remaining = budget
+        attempts = 0
+        max_attempts = len(self.pool) * 2
+
+        while remaining > (target_tokens * tolerance) and attempts < max_attempts:
+            candidate = self._pick_stratified(used, set())
+            if candidate is None:
+                break
+            qa_tok = self._qa_tokens[candidate["id"]]
+            if qa_tok <= remaining + (target_tokens * tolerance * 0.5):
+                exemplars.append((candidate, qa_tok))
+                remaining -= qa_tok
+                used.add(candidate["id"])
+            attempts += 1
+
+        # Fill remaining gaps with small Q&A pairs
+        if remaining > 0:
+            small = sorted(
+                [r for r in self.pool if r["id"] not in used],
+                key=lambda r: self._qa_tokens.get(r["id"], 0),
+            )
+            for c in small:
+                qa_tok = self._qa_tokens[c["id"]]
+                if qa_tok <= remaining:
+                    exemplars.append((c, qa_tok))
+                    remaining -= qa_tok
+                    used.add(c["id"])
+                    if remaining <= 0:
+                        break
+
+        return exemplars, remaining
+
+    def _exemplars_to_text(self, exemplars: List[Tuple[Dict, int]]) -> str:
+        """Render exemplar list to prompt text."""
+        parts = []
+        for rec, _ in exemplars:
+            parts.append(
+                QA_TEMPLATE.format(question=rec["question"], answer=rec["answer"])
+            )
+        return "".join(parts)
+
+    def build_prefix_batch(
+        self,
+        target_tokens: int,
+        num_samples: int,
+        prefix_rate: float,
+        tolerance: float = 0.05,
+        min_qa_pairs: int = 2,
+    ) -> List[Dict]:
+        """Build a batch of prompts sharing a common prefix.
+
+        The first ``target_tokens * prefix_rate`` tokens are **identical** across
+        all samples (the common prefix built from the same Q&A pairs, in the
+        same order). The remaining tokens are **unique per sample**, ensuring
+        that the non-cached suffix differs across requests.
+
+        Args:
+            target_tokens: Total desired token count per sample.
+            num_samples: Number of samples in the batch.
+            prefix_rate: Fraction of tokens that form the common (cache-hit)
+                         prefix. 0.0 = all unique, 0.9 = 90% shared.
+            tolerance: Acceptable fractional deviation from target.
+            min_qa_pairs: Minimum exemplar Q&A pairs in the unique suffix.
+
+        Returns:
+            List of dicts, each with keys: question, question_token_len,
+            final_question, source, num_exemplars, target_tokens,
+            prefix_rate, batch_id, common_exemplars, unique_exemplars.
+        """
+        if not 0.0 <= prefix_rate <= 1.0:
+            raise ValueError(f"prefix_rate must be in [0, 1], got {prefix_rate}")
+
+        if prefix_rate == 0.0:
+            # Degenerate case: no common prefix, fall back to independent samples
+            return self.build_many(target_tokens, num_samples, tolerance, min_qa_pairs)
+
+        common_target = int(target_tokens * prefix_rate)
+        unique_target = target_tokens - common_target
+
+        # ---- Phase 1: Build the common prefix (shared across all samples) ----
+        common_budget = common_target - self.instruction_tokens
+        common_exemplars, _ = self._fill_exemplars(
+            common_budget, set(), tolerance, target_tokens
+        )
+        common_used_ids = {rec["id"] for rec, _ in common_exemplars}
+
+        # Render the common prefix text (fixed for all samples)
+        common_text = INSTRUCTION + self._exemplars_to_text(common_exemplars)
+        common_text_tokens = _format_count(common_text, self.tokenizer)
+
+        # ---- Phase 2: Build unique suffix per sample ----
+        import uuid
+        batch_id = uuid.uuid4().hex[:8]
+        results: List[Dict] = []
+        used_final_qs: Set[str] = set()
+
+        for i in range(num_samples):
+            # Pick a unique final question
+            available_final = [r for r in self.pool if r["id"] not in used_final_qs]
+            if not available_final:
+                used_final_qs.clear()
+                available_final = list(self.pool)
+
+            final_qa = random.choice(available_final)
+            used_final_qs.add(final_qa["id"])
+
+            final_q_formatted = FINAL_Q_TEMPLATE.format(question=final_qa["question"])
+            final_q_tokens = self._q_only_tokens[final_qa["id"]]
+
+            # Build unique exemplars (exclude common prefix IDs + final question)
+            exclude = common_used_ids | {final_qa["id"]}
+            unique_budget = unique_target - final_q_tokens
+            unique_exemplars, _ = self._fill_exemplars(
+                max(unique_budget, 1), exclude, tolerance, target_tokens
+            )
+
+            # Ensure minimum Q&A pairs in unique suffix
+            while len(unique_exemplars) < min_qa_pairs:
+                candidates = [
+                    r for r in self.pool
+                    if r["id"] not in exclude
+                    and r["id"] not in {rec["id"] for rec, _ in unique_exemplars}
+                ]
+                if not candidates:
+                    break
+                c = random.choice(candidates)
+                qa_tok = self._qa_tokens[c["id"]]
+                unique_exemplars.append((c, qa_tok))
+                exclude.add(c["id"])
+
+            random.shuffle(unique_exemplars)
+            unique_text = self._exemplars_to_text(unique_exemplars)
+
+            # Assemble full prompt
+            full_prompt = common_text + unique_text + final_q_formatted
+            actual_tokens = _format_count(full_prompt, self.tokenizer, add_special_tokens=True)
+
+            results.append({
+                "question": full_prompt,
+                "question_token_len": actual_tokens,
+                "final_question": final_qa["question"],
+                "source": f"prefix{prefix_rate}_batch{batch_id}",
+                "num_exemplars": len(common_exemplars) + len(unique_exemplars),
+                "common_exemplars": len(common_exemplars),
+                "unique_exemplars": len(unique_exemplars),
+                "target_tokens": target_tokens,
+                "prefix_rate": prefix_rate,
+                "batch_id": batch_id,
+            })
+
+        # Cross-prompt dedup of final questions
+        from dedup import cross_prompt_dedup
+        results = cross_prompt_dedup(results, key="final_question")
+
+        return results

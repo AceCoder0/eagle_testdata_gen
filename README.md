@@ -52,14 +52,28 @@ python build_testdata.py \
     --output_dir ./output/
 ```
 
+### 第三步（可选）：生成 Prefix Cache 命中率测试数据
+
+```bash
+# 60% 共同前缀：同一个 batch 内所有样本前 60% 的 token 序列完全一致
+python build_testdata.py \
+    --pool math_pool.jsonl \
+    --targets 32000 \
+    --samples 500 \
+    --prefix_rate 0.6 \
+    --output_dir ./output/
+```
+
 输出文件：
 ```
 output/
-├── testdata_3k.jsonl      # 3.5k tokens × 500 条
-├── testdata_16k.jsonl     # 16k tokens × 500 条
-├── testdata_32k.jsonl     # 32k tokens × 500 条
-├── testdata_64k.jsonl     # 64k tokens × 500 条
-└── testdata_200k.jsonl    # 200k tokens × 500 条
+├── testdata_3k.jsonl         # 3.5k tokens × 500 条（独立样本）
+├── testdata_16k.jsonl        # 16k tokens × 500 条
+├── testdata_32k.jsonl        # 32k tokens × 500 条
+├── testdata_32k_p0_6.jsonl   # 32k tokens × 500 条，60% 共同前缀
+├── testdata_32k_p0_9.jsonl   # 32k tokens × 500 条，90% 共同前缀
+├── testdata_64k.jsonl        # 64k tokens × 500 条
+└── testdata_200k.jsonl       # 200k tokens × 500 条
 ```
 
 ## 输出数据结构
@@ -152,6 +166,76 @@ output/
 | **样本内去重** | 同一个 prompt 内不会出现重复 Q&A |
 | **分层采样** | 轮转从不同数据集选取示例，避免单一来源 |
 
+## Prefix Cache 命中率测试
+
+支持生成带有**共同前缀**的测试数据，用于评估推理框架（vLLM, SGLang）的 prefix cache / automatic prefix caching 效果。
+
+### 核心思路
+
+通过 `--prefix_rate` 参数控制所有样本的**共同前缀比例**。共同前缀部分使用**完全相同的 Q&A 对（相同顺序）**拼接，唯一后缀部分使用**不同的 Q&A 对**拼接。
+
+```
+样本 1: ┌─── 共同前缀 (60%) ───┐┌─ 唯一后缀 1 ─┐
+样本 2: ┌─── 共同前缀 (60%) ───┐┌─ 唯一后缀 2 ─┐
+样本 3: ┌─── 共同前缀 (60%) ───┐┌─ 唯一后缀 3 ─┐
+        ^^^^^^ 完全相同 ^^^^^^    ^^^ 各不相同 ^^^
+        → KV cache 命中          → 需重新计算
+```
+
+- **共同前缀**：所有样本的第 1 到第 N 个 token **完全一致** → 推理框架只需计算一次 KV cache
+- **唯一后缀**：每个样本从 N+1 个 token 开始**不同** → 各自独立计算
+
+### 使用方式
+
+```bash
+# prefix_rate=0.6: 60% 共同前缀，40% 唯一后缀
+python build_testdata.py \
+    --pool math_pool.jsonl \
+    --targets 32000 \
+    --samples 500 \
+    --prefix_rate 0.6 \
+    --output_dir ./output/
+
+# prefix_rate=0.9: 90% 共同前缀，10% 唯一后缀  
+python build_testdata.py \
+    --pool math_pool.jsonl \
+    --targets 32000 \
+    --samples 500 \
+    --prefix_rate 0.9 \
+    --output_dir ./output/
+
+# prefix_rate=0: 无共同前缀（等价于普通模式）
+python build_testdata.py \
+    --pool math_pool.jsonl \
+    --targets 32000 \
+    --samples 500 \
+    --prefix_rate 0
+```
+
+### 实测效果（500 条 × 32k，prefix_rate=0.6）
+
+```
+Generated:        500/500 samples
+Within tolerance:  500/500 (100%)
+Length mean:       32,029 tokens
+Length range:      31,975 - 32,763 tokens
+Common exemplars:  82 (same Q&A pairs across all samples)
+Unique exemplars:  76 (different Q&A pairs per sample)
+Verified:          53,730 chars identical across ALL 500 samples
+Actual hit rate:   60.0% of tokens are shared
+```
+
+### 输出数据额外字段
+
+使用 prefix cache 模式时，每条记录额外包含：
+
+| 字段 | 含义 |
+|------|------|
+| `prefix_rate` | 共同前缀比例（如 0.6） |
+| `batch_id` | 批次 ID，同一批次共享共同前缀 |
+| `common_exemplars` | 共同前缀中包含的 Q&A 对数 |
+| `unique_exemplars` | 唯一后缀中包含的 Q&A 对数 |
+
 ## 命令行参考
 
 ### `download_datasets.py`
@@ -170,6 +254,7 @@ python download_datasets.py \
 | `--pool` | `math_pool.jsonl` | 数据池路径 |
 | `--targets` | `3500,16000,32000,64000,200000` | 目标 token 长度，逗号分隔 |
 | `--samples` | `100` | 每个长度生成条数 |
+| `--prefix_rate` | `0.0` | 共同前缀比例 [0, 1]。0=独立样本；0.6=60% 共享前缀 |
 | `--tolerance` | `0.05` | 允许偏差 (±5%) |
 | `--min_qa_pairs` | `2` | 最少 few-shot 示例数 |
 | `--output_dir` | `./output/` | 输出目录 |

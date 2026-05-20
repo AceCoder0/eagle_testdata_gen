@@ -63,6 +63,11 @@ def main():
                         help="Answer style for few-shot exemplars: mixed (default), "
                              "detailed (prefer long step-by-step answers), "
                              "concise (prefer short final answers)")
+    parser.add_argument("--min_answer_tokens", type=int, default=0,
+                        help="Minimum answer tokens for pool records. "
+                             "Filters both exemplars AND final questions. "
+                             "Use to guide model toward natural long outputs "
+                             "(e.g. 512 for 1024-token target output)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility")
     args = parser.parse_args()
@@ -116,7 +121,11 @@ def main():
 
     # Initialize few-shot builder
     builder = FewShotBuilder(pool, tokenizer, seed=args.seed,
-                             answer_style=args.answer_style)
+                             answer_style=args.answer_style,
+                             min_answer_tokens=args.min_answer_tokens)
+    if args.min_answer_tokens > 0:
+        print(f"  After min_answer_tokens filter ({args.min_answer_tokens}): "
+              f"{len(builder.pool)} records (from {len(pool)})")
 
     use_prefix = args.prefix_rate > 0.0
 

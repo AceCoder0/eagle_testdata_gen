@@ -557,3 +557,65 @@ class TestAnswerStyle:
         # The detailed builder should have fewer exemplars (since they're longer)
         assert r_detailed["num_exemplars"] <= r_concise["num_exemplars"] + 2, \
             "Detailed style should pack fewer (longer-answer) exemplars"
+
+
+# ---------------------------------------------------------------------------
+# min_answer_tokens tests (issue #5)
+# ---------------------------------------------------------------------------
+
+class TestMinAnswerTokens:
+    def test_default_zero_no_filter(self, synthetic_pool, tokenizer):
+        b = FewShotBuilder(synthetic_pool, tokenizer, seed=42)
+        assert len(b.pool) == len(synthetic_pool)
+
+    def test_filters_short_answers(self, synthetic_pool, tokenizer):
+        # Find a threshold that filters roughly half the records
+        sorted_pool = sorted(synthetic_pool, key=lambda r: r["answer_tokens"])
+        median_at = sorted_pool[len(sorted_pool) // 2]["answer_tokens"]
+        b = FewShotBuilder(synthetic_pool, tokenizer, seed=42,
+                           min_answer_tokens=median_at + 1)
+        assert len(b.pool) < len(synthetic_pool)
+        for r in b.pool:
+            assert r["answer_tokens"] >= median_at + 1
+
+    def test_filter_zero_includes_all(self, synthetic_pool, tokenizer):
+        b = FewShotBuilder(synthetic_pool, tokenizer, seed=42, min_answer_tokens=0)
+        assert len(b.pool) == len(synthetic_pool)
+
+    def test_filter_too_high_raises(self, synthetic_pool, tokenizer):
+        max_at = max(r["answer_tokens"] for r in synthetic_pool)
+        with pytest.raises(ValueError, match="No records"):
+            FewShotBuilder(synthetic_pool, tokenizer, seed=42,
+                           min_answer_tokens=max_at + 100)
+
+    def test_filtered_pool_exemplars_respect_threshold(self, synthetic_pool, tokenizer):
+        """build_one should only use exemplars with answer_tokens >= threshold."""
+        min_at = 15  # synthetic pool has answers with ~14-56 tokens
+        b = FewShotBuilder(synthetic_pool, tokenizer, seed=42, min_answer_tokens=min_at)
+        rec = b.build_one(target_tokens=2000, used_final_qs=set(), tolerance=0.10)
+        assert rec is not None
+        # The final question itself should also be from filtered pool
+        assert rec["final_question"]
+        # All records in filtered pool have answer_tokens >= min_at
+        for r in b.pool:
+            assert r["answer_tokens"] >= min_at
+
+    def test_filtered_pool_build_many_works(self, synthetic_pool, tokenizer):
+        """build_many should work with filtered pool."""
+        min_at = 15
+        b = FewShotBuilder(synthetic_pool, tokenizer, seed=42, min_answer_tokens=min_at)
+        results = b.build_many(target_tokens=2000, num_samples=5, tolerance=0.10)
+        assert len(results) == 5
+        for r in results:
+            assert r["final_question"]  # final question came from filtered pool
+
+    def test_filtered_pool_prefix_batch_works(self, synthetic_pool, tokenizer):
+        """build_prefix_batch should work with filtered pool."""
+        min_at = 15
+        b = FewShotBuilder(synthetic_pool, tokenizer, seed=42, min_answer_tokens=min_at)
+        results = b.build_prefix_batch(
+            target_tokens=4000, num_samples=5, prefix_rate=0.5, tolerance=0.10
+        )
+        assert len(results) == 5
+        for r in results:
+            assert r["final_question"]

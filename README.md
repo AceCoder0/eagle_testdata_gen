@@ -280,6 +280,7 @@ python download_datasets.py --source opencompass --output_pool math_pool.jsonl
 | `--tolerance` | `0.05` | 允许偏差 (±5%) |
 | `--min_qa_pairs` | `2` | 最少 few-shot 示例数 |
 | `--answer_style` | `mixed` | 答案风格：`mixed`（混合）、`detailed`（优先长答案带推理）、`concise`（优先短答案） |
+| `--min_answer_tokens` | `0` | 过滤数据池，只保留答案 ≥N tokens 的记录。同时影响 exemplar 和最终问题，用于引导模型自然长输出 |
 | `--tokenizer_path` | `./DeepSeekR1` | Tokenizer 路径。支持本地路径或 HF 模型名（如 `deepseek-ai/DeepSeek-V3`） |
 | `--output_dir` | `./output/` | 输出目录 |
 | `--seed` | `42` | 随机种子 |

@@ -40,11 +40,21 @@ class FewShotBuilder:
     """Builds few-shot prompts of approximate target token lengths."""
 
     def __init__(self, pool: List[Dict], tokenizer, seed: int = 42,
-                 answer_style: str = "mixed"):
-        self.pool = pool
+                 answer_style: str = "mixed", min_answer_tokens: int = 0):
         self.tokenizer = tokenizer
         self.rng = random.Random(seed)
         self.answer_style = answer_style
+
+        # Filter pool by minimum answer token length
+        if min_answer_tokens > 0:
+            self.pool = [r for r in pool if r.get("answer_tokens", 0) >= min_answer_tokens]
+            if len(self.pool) == 0:
+                raise ValueError(
+                    f"No records with answer_tokens >= {min_answer_tokens} "
+                    f"(pool has {len(pool)} records)"
+                )
+        else:
+            self.pool = list(pool)
 
         # Pre-compute formatted token counts for each pool entry
         self._qa_tokens: Dict[str, int] = {}

@@ -436,3 +436,124 @@ class TestReproducibility:
             target_tokens=3000, num_samples=3, prefix_rate=0.5, tolerance=0.10
         )
         assert r1[0]["batch_id"] != r2[0]["batch_id"]
+
+
+# ---------------------------------------------------------------------------
+# answer key tests (issue #1)
+# ---------------------------------------------------------------------------
+
+class TestAnswerKey:
+    def test_build_one_has_answer_key(self, builder):
+        rec = builder.build_one(target_tokens=2000, used_final_qs=set(), tolerance=0.10)
+        assert "answer" in rec
+        assert rec["answer"] == ""
+
+    def test_build_many_has_answer_key(self, builder):
+        results = builder.build_many(target_tokens=2000, num_samples=5, tolerance=0.10)
+        for r in results:
+            assert "answer" in r
+            assert r["answer"] == ""
+
+    def test_prefix_batch_has_answer_key(self, builder):
+        results = builder.build_prefix_batch(
+            target_tokens=4000, num_samples=5, prefix_rate=0.5, tolerance=0.10
+        )
+        for r in results:
+            assert "answer" in r
+            assert r["answer"] == ""
+
+
+# ---------------------------------------------------------------------------
+# target parsing tests (issue #3 — k=1024)
+# ---------------------------------------------------------------------------
+
+class TestTargetParsing:
+    def _parse(self, targets_str):
+        targets = []
+        for t in targets_str.split(","):
+            t = t.strip()
+            if not t:
+                continue
+            if t.lower().endswith("k"):
+                targets.append(int(float(t[:-1]) * 1024))
+            else:
+                targets.append(int(t))
+        return targets
+
+    def test_k_suffix_1024(self):
+        assert self._parse("32k") == [32768]
+        assert self._parse("64k") == [65536]
+        assert self._parse("4k") == [4096]
+
+    def test_raw_numbers(self):
+        assert self._parse("32768") == [32768]
+        assert self._parse("200000") == [200000]
+
+    def test_mixed_k_and_raw(self):
+        assert self._parse("32k,100000,64k") == [32768, 100000, 65536]
+
+    def test_uppercase_K(self):
+        assert self._parse("32K") == [32768]
+
+    def test_decimal_k(self):
+        assert self._parse("3.5k") == [3584]  # 3.5 * 1024
+
+
+# ---------------------------------------------------------------------------
+# answer_style tests (issue #4)
+# ---------------------------------------------------------------------------
+
+class TestAnswerStyle:
+    def test_default_style_is_mixed(self, synthetic_pool, tokenizer):
+        b = FewShotBuilder(synthetic_pool, tokenizer, seed=42)
+        assert b.answer_style == "mixed"
+
+    def test_detailed_style_stored(self, synthetic_pool, tokenizer):
+        b = FewShotBuilder(synthetic_pool, tokenizer, seed=42, answer_style="detailed")
+        assert b.answer_style == "detailed"
+
+    def test_concise_style_stored(self, synthetic_pool, tokenizer):
+        b = FewShotBuilder(synthetic_pool, tokenizer, seed=42, answer_style="concise")
+        assert b.answer_style == "concise"
+
+    def test_pick_by_style_mixed_returns_from_candidates(self, synthetic_pool, tokenizer):
+        b = FewShotBuilder(synthetic_pool, tokenizer, seed=42, answer_style="mixed")
+        candidates = synthetic_pool[:10]
+        picked = b._pick_by_style(candidates)
+        assert picked in candidates
+
+    def test_pick_by_style_detailed_prefers_long_answers(self, synthetic_pool, tokenizer):
+        """Run many selections; average answer_tokens should be above median."""
+        b = FewShotBuilder(synthetic_pool, tokenizer, seed=42, answer_style="detailed")
+        # Sort pool by answer_tokens to get median
+        sorted_pool = sorted(synthetic_pool, key=lambda r: r.get("answer_tokens", 0))
+        median_at = sorted_pool[len(sorted_pool) // 2]["answer_tokens"]
+
+        picks = [b._pick_by_style(list(synthetic_pool)) for _ in range(50)]
+        avg_tokens = sum(r["answer_tokens"] for r in picks) / len(picks)
+        assert avg_tokens > median_at, \
+            f"Expected avg tokens {avg_tokens} > median {median_at}"
+
+    def test_pick_by_style_concise_prefers_short_answers(self, synthetic_pool, tokenizer):
+        """Run many selections; average answer_tokens should be below median."""
+        b = FewShotBuilder(synthetic_pool, tokenizer, seed=42, answer_style="concise")
+        sorted_pool = sorted(synthetic_pool, key=lambda r: r.get("answer_tokens", 0))
+        median_at = sorted_pool[len(sorted_pool) // 2]["answer_tokens"]
+
+        picks = [b._pick_by_style(list(synthetic_pool)) for _ in range(50)]
+        avg_tokens = sum(r["answer_tokens"] for r in picks) / len(picks)
+        assert avg_tokens < median_at, \
+            f"Expected avg tokens {avg_tokens} < median {median_at}"
+
+    def test_detailed_build_one_uses_longer_answers(self, synthetic_pool, tokenizer):
+        """build_one with detailed style should select higher answer_token exemplars."""
+        b_detailed = FewShotBuilder(synthetic_pool, tokenizer, seed=42, answer_style="detailed")
+        b_concise = FewShotBuilder(synthetic_pool, tokenizer, seed=42, answer_style="concise")
+
+        # Build one sample from each
+        r_detailed = b_detailed.build_one(target_tokens=2000, used_final_qs=set(), tolerance=0.10)
+        r_concise = b_concise.build_one(target_tokens=2000, used_final_qs=set(), tolerance=0.10)
+
+        # The detailed builder should have fewer exemplars (since they're longer)
+        assert r_detailed["num_exemplars"] <= r_concise["num_exemplars"] + 2, \
+            "Detailed style should pack fewer (longer-answer) exemplars"

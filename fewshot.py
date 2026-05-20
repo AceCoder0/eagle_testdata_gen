@@ -39,10 +39,12 @@ def _format_count(text: str, tokenizer, add_special_tokens: bool = False) -> int
 class FewShotBuilder:
     """Builds few-shot prompts of approximate target token lengths."""
 
-    def __init__(self, pool: List[Dict], tokenizer, seed: int = 42):
+    def __init__(self, pool: List[Dict], tokenizer, seed: int = 42,
+                 answer_style: str = "mixed"):
         self.pool = pool
         self.tokenizer = tokenizer
         self.rng = random.Random(seed)
+        self.answer_style = answer_style
 
         # Pre-compute formatted token counts for each pool entry
         self._qa_tokens: Dict[str, int] = {}
@@ -66,6 +68,15 @@ class FewShotBuilder:
             src = r.get("source", "unknown")
             self._by_source.setdefault(src, []).append(r)
 
+    def _pick_by_style(self, candidates: List[Dict]) -> Dict:
+        """Pick a candidate biased by answer_style preference."""
+        if self.answer_style == "mixed":
+            return self.rng.choice(candidates)
+        reverse = self.answer_style == "detailed"
+        candidates.sort(key=lambda r: r.get("answer_tokens", 0), reverse=reverse)
+        n = max(1, len(candidates) // 2)
+        return self.rng.choice(candidates[:n])
+
     def _pick_stratified(self, used_ids: Set[str], sources_used: Set[str]) -> Optional[Dict]:
         """Pick a random Q&A from a source dataset not yet used in this prompt."""
         available_sources = [s for s in self._by_source if s not in sources_used]
@@ -76,12 +87,12 @@ class FewShotBuilder:
         for src in available_sources:
             candidates = [r for r in self._by_source[src] if r["id"] not in used_ids]
             if candidates:
-                return self.rng.choice(candidates)
+                return self._pick_by_style(candidates)
 
         # Fallback: any unused record
         candidates = [r for r in self.pool if r["id"] not in used_ids]
         if candidates:
-            return self.rng.choice(candidates)
+            return self._pick_by_style(candidates)
         return None
 
     def build_one(
@@ -115,7 +126,7 @@ class FewShotBuilder:
             used_final_qs.clear()
             available_final = list(self.pool)
 
-        final_qa = self.rng.choice(available_final)
+        final_qa = self._pick_by_style(available_final)
         used_final_qs.add(final_qa["id"])
 
         final_q_formatted = FINAL_Q_TEMPLATE.format(question=final_qa["question"])
@@ -151,7 +162,7 @@ class FewShotBuilder:
             candidates = [r for r in self.pool if r["id"] not in used_in_prompt]
             if not candidates:
                 break
-            c = self.rng.choice(candidates)
+            c = self._pick_by_style(candidates)
             qa_tok = self._qa_tokens[c["id"]]
             exemplars.append((c, qa_tok))
             budget -= qa_tok
@@ -187,6 +198,7 @@ class FewShotBuilder:
 
         return {
             "question": full_prompt,
+            "answer": "",
             "question_token_len": actual_tokens,
             "final_question": final_qa["question"],
             "source": f"fewshot_{len(exemplars)}_exemplars",
@@ -361,7 +373,7 @@ class FewShotBuilder:
                 ]
                 if not candidates:
                     break
-                c = self.rng.choice(candidates)
+                c = self._pick_by_style(candidates)
                 qa_tok = self._qa_tokens[c["id"]]
                 unique_exemplars.append((c, qa_tok))
                 exclude.add(c["id"])
@@ -375,6 +387,7 @@ class FewShotBuilder:
 
             results.append({
                 "question": full_prompt,
+                "answer": "",
                 "question_token_len": actual_tokens,
                 "final_question": final_qa["question"],
                 "source": f"prefix{prefix_rate}_batch{batch_id}",

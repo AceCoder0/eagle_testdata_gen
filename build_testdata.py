@@ -39,8 +39,10 @@ def main():
     )
     parser.add_argument("--pool", type=str, default="math_pool.jsonl",
                         help="Path to math Q&A pool JSONL (from download_datasets.py)")
-    parser.add_argument("--targets", type=str, default="3500,16000,32000,64000,200000",
-                        help="Comma-separated target input token lengths")
+    parser.add_argument("--targets", type=str, default="4k,16k,32k,64k,200k",
+                        help="Comma-separated target input token lengths. "
+                             "Use 'k' suffix for x1024 (e.g. 32k=32768), "
+                             "or raw numbers (e.g. 32768)")
     parser.add_argument("--samples", type=int, default=100,
                         help="Number of samples per target length")
     parser.add_argument("--tolerance", type=float, default=0.05,
@@ -56,6 +58,11 @@ def main():
                         help="Path to tokenizer directory")
     parser.add_argument("--output_dir", type=str, default="./output",
                         help="Directory for output JSONL files")
+    parser.add_argument("--answer_style", type=str, default="mixed",
+                        choices=["mixed", "detailed", "concise"],
+                        help="Answer style for few-shot exemplars: mixed (default), "
+                             "detailed (prefer long step-by-step answers), "
+                             "concise (prefer short final answers)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility")
     args = parser.parse_args()
@@ -65,8 +72,16 @@ def main():
 
     random.seed(args.seed)
 
-    # Parse targets
-    targets = [int(t.strip()) for t in args.targets.split(",") if t.strip()]
+    # Parse targets: support "32k" suffix (k=1024) and raw numbers
+    targets = []
+    for t in args.targets.split(","):
+        t = t.strip()
+        if not t:
+            continue
+        if t.lower().endswith("k"):
+            targets.append(int(float(t[:-1]) * 1024))
+        else:
+            targets.append(int(t))
     targets.sort()
 
     # Load tokenizer
@@ -100,13 +115,14 @@ def main():
     print(f"\n  Total pool tokens (Q+A): {max_qa_tokens:,}")
 
     # Initialize few-shot builder
-    builder = FewShotBuilder(pool, tokenizer, seed=args.seed)
+    builder = FewShotBuilder(pool, tokenizer, seed=args.seed,
+                             answer_style=args.answer_style)
 
     use_prefix = args.prefix_rate > 0.0
 
     # Generate test cases for each target length
     for target in targets:
-        label = f"{target // 1000}k" if target >= 1000 else str(target)
+        label = f"{target // 1024}k" if target >= 1024 else str(target)
 
         if use_prefix:
             pr_label = f"p{str(args.prefix_rate).replace('.', '_')}"

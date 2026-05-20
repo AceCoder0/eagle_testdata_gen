@@ -46,16 +46,23 @@ python download_datasets.py --source opencompass --output_pool math_pool.jsonl
 ### 第二步：构造测试用例
 
 ```bash
-# 单个长度
-python build_testdata.py --pool math_pool.jsonl --targets 32000 --samples 500
+# 单个长度（32k = 32768 tokens）
+python build_testdata.py --pool math_pool.jsonl --targets 32k --samples 500
 
-# 多个长度一起生成
+# 多个长度一起生成（支持 k 后缀和纯数字混合）
 python build_testdata.py \
     --pool math_pool.jsonl \
-    --targets 3500,16000,32000,64000,200000 \
+    --targets 4k,16k,32k,64k,200k \
     --samples 500 \
     --tolerance 0.05 \
     --output_dir ./output/
+
+# 使用其他模型的 tokenizer（首次自动下载）
+python build_testdata.py \
+    --pool math_pool.jsonl \
+    --targets 32k \
+    --samples 500 \
+    --tokenizer_path Qwen/Qwen2.5-7B-Instruct
 ```
 
 ### 第三步（可选）：生成 Prefix Cache 命中率测试数据
@@ -267,11 +274,13 @@ python download_datasets.py --source opencompass --output_pool math_pool.jsonl
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--pool` | `math_pool.jsonl` | 数据池路径 |
-| `--targets` | `3500,16000,32000,64000,200000` | 目标 token 长度，逗号分隔 |
+| `--targets` | `4k,16k,32k,64k,200k` | 目标 token 长度，逗号分隔。支持 `k` 后缀 (×1024，如 `32k`=32768) 或纯数字 |
 | `--samples` | `100` | 每个长度生成条数 |
 | `--prefix_rate` | `0.0` | 共同前缀比例 [0, 1]。0=独立样本；0.6=60% 共享前缀 |
 | `--tolerance` | `0.05` | 允许偏差 (±5%) |
 | `--min_qa_pairs` | `2` | 最少 few-shot 示例数 |
+| `--answer_style` | `mixed` | 答案风格：`mixed`（混合）、`detailed`（优先长答案带推理）、`concise`（优先短答案） |
+| `--tokenizer_path` | `./DeepSeekR1` | Tokenizer 路径。支持本地路径或 HF 模型名（如 `deepseek-ai/DeepSeek-V3`） |
 | `--output_dir` | `./output/` | 输出目录 |
 | `--seed` | `42` | 随机种子 |
 

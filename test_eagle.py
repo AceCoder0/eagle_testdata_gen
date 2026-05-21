@@ -20,6 +20,7 @@ from fewshot import (
     _format_count,
 )
 from shuffle import shuffle_jsonl
+from enrich_pool import select_hard_problems, make_record_id
 
 
 # ---------------------------------------------------------------------------
@@ -616,6 +617,219 @@ class TestMinAnswerTokens:
         results = b.build_prefix_batch(
             target_tokens=4000, num_samples=5, prefix_rate=0.5, tolerance=0.10
         )
+        assert len(results) == 5
+        for r in results:
+            assert r["final_question"]
+
+
+# ---------------------------------------------------------------------------
+# enrich_pool tests — problem selection & record formatting
+# ---------------------------------------------------------------------------
+
+class TestEnrichPool:
+    def test_select_hard_problems_respects_num_samples(self, synthetic_pool):
+        """Selection should not exceed num_samples."""
+        result = select_hard_problems(synthetic_pool, num_samples=30, seed=42)
+        assert len(result) <= 30
+
+    def test_select_hard_problems_non_empty(self, synthetic_pool):
+        """Should return at least some problems when AIME exists."""
+        pool = list(synthetic_pool)
+        for i, r in enumerate(pool[:5]):
+            r["source"] = "aime2024"
+            r["id"] = f"aime_{i}"
+        result = select_hard_problems(pool, num_samples=50, seed=42)
+        assert len(result) > 0
+
+    def test_select_hard_problems_diverse_sources(self, synthetic_pool):
+        """Output should span multiple source datasets."""
+        pool = list(synthetic_pool)
+        for i, r in enumerate(pool[:5]):
+            r["source"] = "aime2024"
+            r["id"] = f"aime_{i}"
+        for i, r in enumerate(pool[5:15]):
+            r["source"] = "math_500"
+            r["id"] = f"math_{i}"
+        result = select_hard_problems(pool, num_samples=100, seed=42)
+        sources = set(r["source"] for r in result)
+        assert len(sources) >= 2, f"Expected >=2 sources, got {sources}"
+
+    def test_select_hard_problems_empty_pool(self):
+        """Empty pool should return empty list."""
+        assert select_hard_problems([], num_samples=50, seed=42) == []
+
+    def test_select_hard_problems_prefers_aime(self, synthetic_pool):
+        """AIME problems should be prioritized (all taken) when available."""
+        # Create a pool with aime2024 markers
+        pool = list(synthetic_pool)
+        for i, r in enumerate(pool[:5]):
+            r["source"] = "aime2024"
+            r["id"] = f"aime_{i}"
+        result = select_hard_problems(pool, num_samples=50, seed=42)
+        aime_ids = [r["id"] for r in result if r["source"] == "aime2024"]
+        assert len(aime_ids) == 5, "All AIME problems should be included"
+
+    def test_select_hard_problems_reproducible(self, synthetic_pool):
+        """Same seed + same pool -> same selection order."""
+        r1 = select_hard_problems(synthetic_pool, num_samples=50, seed=42)
+        r2 = select_hard_problems(synthetic_pool, num_samples=50, seed=42)
+        assert [r["id"] for r in r1] == [r["id"] for r in r2]
+
+    def test_make_record_id_deterministic(self):
+        """Same inputs produce same id."""
+        assert make_record_id("abc", "MiniMax-M2.5") == make_record_id("abc", "MiniMax-M2.5")
+
+    def test_make_record_id_different_inputs(self):
+        """Different inputs produce different ids."""
+        assert make_record_id("abc", "M1") != make_record_id("xyz", "M1")
+        assert make_record_id("abc", "M1") != make_record_id("abc", "M2")
+
+    def test_make_record_id_format(self):
+        """Output should be a hex string of length 16."""
+        rid = make_record_id("test_id", "MiniMax-M2.5")
+        assert len(rid) == 16
+        assert all(c in "0123456789abcdef" for c in rid)
+
+
+# ---------------------------------------------------------------------------
+# extra_pool merge tests
+# ---------------------------------------------------------------------------
+
+class TestExtraPool:
+    """Test the --extra_pool merge logic (used in build_testdata.py)."""
+
+    def test_extra_pool_merges_records(self, synthetic_pool, tmp_path):
+        """Extra pool records should be appended to main pool."""
+        from dedup import exact_dedup
+        # Write main pool
+        main_file = tmp_path / "main.jsonl"
+        with open(main_file, "w") as f:
+            for r in synthetic_pool[:100]:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+        # Write extra pool
+        extra_file = tmp_path / "extra.jsonl"
+        extra_records = []
+        for i in range(20):
+            q = f"Extra problem {i}: Compute integral of x^{i} dx."
+            a = f"Detailed solution {i}: " + "Step-by-step. " * 50
+            extra_records.append({
+                "id": f"extra_{i}",
+                "question": q,
+                "answer": a,
+                "source": "enriched_math_500",
+                "question_tokens": len(q.split()),
+                "answer_tokens": len(a.split()),
+                "total_tokens": len(q.split()) + len(a.split()),
+            })
+        with open(extra_file, "w") as f:
+            for r in extra_records:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+        # Merge
+        pool = load_pool(str(main_file))
+        extra = load_pool(str(extra_file))
+        before = len(pool)
+        pool.extend(extra)
+        pool = exact_dedup(pool, key="question")
+
+        assert len(pool) == before + len(extra_records)
+        assert any(r["source"] == "enriched_math_500" for r in pool)
+
+    def test_extra_pool_dedup_cross_pool(self, synthetic_pool, tmp_path):
+        """Duplicates across main and extra pool should be removed."""
+        from dedup import exact_dedup
+        # Create a shared question
+        shared_q = "Unique shared math problem: find x where x + 1 = 2."
+
+        main_records = list(synthetic_pool[:10])
+        main_records.append({
+            "id": "main_shared",
+            "question": shared_q,
+            "answer": "x = 1",
+            "source": "gsm8k",
+            "question_tokens": 10,
+            "answer_tokens": 5,
+            "total_tokens": 15,
+        })
+
+        extra_records = [{
+            "id": "extra_shared",
+            "question": shared_q,  # same question!
+            "answer": "Let me explain step by step. First, we have x + 1 = 2. "
+                      "Subtract 1 from both sides... " * 20,
+            "source": "enriched_gsm8k",
+            "question_tokens": 10,
+            "answer_tokens": 200,
+            "total_tokens": 210,
+        }]
+
+        main_file = tmp_path / "main2.jsonl"
+        with open(main_file, "w") as f:
+            for r in main_records:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+        extra_file = tmp_path / "extra2.jsonl"
+        with open(extra_file, "w") as f:
+            for r in extra_records:
+                f.write(json.dumps(r, ensure_ascii=False) + "\n")
+
+        pool = load_pool(str(main_file))
+        extra = load_pool(str(extra_file))
+        pool.extend(extra)
+        pool = exact_dedup(pool, key="question")
+
+        # The duplicate should be removed (only 1 copy of shared_q)
+        questions = [r["question"] for r in pool]
+        assert questions.count(shared_q) == 1
+
+    def test_extra_pool_with_min_answer_tokens(self, synthetic_pool, tokenizer, tmp_path):
+        """With extra pool, min_answer_tokens should pick enriched records."""
+        # Create main pool (short answers)
+        main_records = []
+        for i in range(50):
+            q = f"Main problem {i}: {i}x + {i*2} = {i*5}."
+            a = f"Answer: {i*3}"
+            main_records.append({
+                "id": f"main_{i}",
+                "question": q,
+                "answer": a,
+                "source": "gsm8k",
+                "question_tokens": _format_count(q, tokenizer),
+                "answer_tokens": _format_count(a, tokenizer),
+                "total_tokens": _format_count(q, tokenizer) + _format_count(a, tokenizer),
+            })
+
+        # Create extra pool (long answers)
+        extra_records = []
+        for i in range(30):
+            q = f"Extra complex problem {i}: Prove theorem about group of order {i+1}."
+            a = f"Detailed proof {i}: " + "Step-by-step reasoning. " * 60
+            extra_records.append({
+                "id": f"extra_{i}",
+                "question": q,
+                "answer": a,
+                "source": "enriched_math_500",
+                "question_tokens": _format_count(q, tokenizer),
+                "answer_tokens": _format_count(a, tokenizer),
+                "total_tokens": _format_count(q, tokenizer) + _format_count(a, tokenizer),
+            })
+
+        from dedup import exact_dedup
+        pool = main_records + extra_records
+        pool = exact_dedup(pool, key="question")
+
+        # Filter by min_answer_tokens — should select extra records
+        min_at = 100
+        b = FewShotBuilder(pool, tokenizer, seed=42, min_answer_tokens=min_at)
+        # All filtered pool records should have answer_tokens >= min_at
+        assert len(b.pool) > 0
+        for r in b.pool:
+            assert r["answer_tokens"] >= min_at, \
+                f"Expected >= {min_at}, got {r['answer_tokens']}"
+
+        # build_many should work with enriched-only pool
+        results = b.build_many(target_tokens=2000, num_samples=5, tolerance=0.10)
         assert len(results) == 5
         for r in results:
             assert r["final_question"]

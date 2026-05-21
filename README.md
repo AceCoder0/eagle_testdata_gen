@@ -249,6 +249,80 @@ Actual hit rate:   60.0% of tokens are shared
 | `common_exemplars` | 共同前缀中包含的 Q&A 对数 |
 | `unique_exemplars` | 唯一后缀中包含的 Q&A 对数 |
 
+## 长答案增强池（自然长输出引导）
+
+当需要测试 **输出 token > 2K** 的 decode 性能时，原始数据池中很少有 `answer_tokens >= 2048` 的记录。`enrich_pool.py` 通过调用 MiniMax API 为精选难题生成极其详细的解答，产出一个"长答案增强池"，与 `--min_answer_tokens` 配合使用。
+
+### 核心思路
+
+```
+math_pool.jsonl (~26,000 条，短/中答案)
+    │
+    ├── 步骤 1: enrich_pool.py 筛选难题
+    │     ├── AIME 2024 + 2025: 全部 (~60 题)
+    │     ├── MATH-500: answer_tokens top ~100
+    │     └── DAPO-Math-17k: 随机 ~40
+    │
+    ├── 步骤 2: MiniMax API 生成详细解答
+    │     每个题生成 1500-4000 token 的详细推理
+    │
+    └── 输出: math_pool_enriched.jsonl (~200 条，长答案)
+```
+
+### 使用方式
+
+```bash
+# 第一步：生成增强池（一次性，需 MiniMax API key）
+python enrich_pool.py \
+    --pool math_pool.jsonl \
+    --output math_pool_enriched.jsonl \
+    --api_key_file ~/llm_keys/minimax \
+    --num_samples 200
+
+# 支持断点续传
+python enrich_pool.py \
+    --pool math_pool.jsonl \
+    --output math_pool_enriched.jsonl \
+    --api_key_file ~/llm_keys/minimax \
+    --resume math_pool_enriched.jsonl.checkpoint.json
+
+# 第二步：用增强池构造测试数据（2k+ 目标输出）
+python build_testdata.py \
+    --pool math_pool.jsonl \
+    --extra_pool math_pool_enriched.jsonl \
+    --targets 32k \
+    --samples 100 \
+    --min_answer_tokens 2048 \
+    --answer_style detailed
+```
+
+### 多样性保证
+
+| 维度 | 机制 |
+|------|------|
+| **题目来源** | 分层采样 AIME + MATH + DAPO，覆盖代数/几何/数论/组合 |
+| **答案风格** | 每个请求 temperature 在 0.7-0.9 随机波动 |
+| **MoE 均衡** | 200 条来自 4 个数据集 + 不同数学分支，避免激活同一 expert |
+| **最终问题** | `--min_answer_tokens` 过滤后，exemplar 和 final question 从不同 source 挑选 |
+
+### `enrich_pool.py` 命令行参考
+
+| 参数 | 默认值 | 说明 |
+|------|--------|------|
+| `--pool` | `math_pool.jsonl` | 输入数据池 |
+| `--output` | `math_pool_enriched.jsonl` | 输出（仅增强记录） |
+| `--num_samples` | `200` | 目标生成数量 |
+| `--api_key_file` | (必填) | MiniMax API key 文件路径 |
+| `--api_base` | `https://api.minimaxi.com/v1` | API 地址（OpenAI 兼容） |
+| `--model` | `MiniMax-M2.5` | 模型名 |
+| `--temperature_low` | `0.7` | 最低温度（每个请求随机波动） |
+| `--temperature_high` | `0.9` | 最高温度 |
+| `--max_output_tokens` | `8192` | 单次最大输出 token 数 |
+| `--tokenizer_path` | `./DeepSeekR1` | Tokenizer 路径 |
+| `--seed` | `42` | 随机种子 |
+| `--resume` | (空) | 从 checkpoint JSON 续传 |
+| `--checkpoint_interval` | `10` | 每 N 条保存检查点 |
+
 ## 命令行参考
 
 ### `download_datasets.py`
@@ -274,6 +348,7 @@ python download_datasets.py --source opencompass --output_pool math_pool.jsonl
 | 参数 | 默认值 | 说明 |
 |------|--------|------|
 | `--pool` | `math_pool.jsonl` | 数据池路径 |
+| `--extra_pool` | (空) | 附加增强池 JSONL（来自 `enrich_pool.py`），与主池合并后使用 |
 | `--targets` | `4k,16k,32k,64k,200k` | 目标 token 长度，逗号分隔。支持 `k` 后缀 (×1024，如 `32k`=32768) 或纯数字 |
 | `--samples` | `100` | 每个长度生成条数 |
 | `--prefix_rate` | `0.0` | 共同前缀比例 [0, 1]。0=独立样本；0.6=60% 共享前缀 |
@@ -301,6 +376,10 @@ python shuffle.py --input_filename output/testdata_32k.jsonl \
 `create_dataset.py` 和 `data_augment.py` 仍保留在仓库中。旧版从通用文本中按长度筛选，使用中文同音替换/字符换位做增强。新版 (`build_testdata.py`) 建议替代旧版使用。
 
 ## 更新日志
+
+### 2026-05-21
+
+- **长答案增强池**：新增 `enrich_pool.py`，通过 MiniMax API 为难题生成详细长答案，支持断点续传。`build_testdata.py` 新增 `--extra_pool` 参数，配合 `--min_answer_tokens` 实现自然长输出引导
 
 ### 2026-05-15
 

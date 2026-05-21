@@ -68,6 +68,9 @@ def main():
                              "Filters both exemplars AND final questions. "
                              "Use to guide model toward natural long outputs "
                              "(e.g. 512 for 1024-token target output)")
+    parser.add_argument("--extra_pool", type=str, default=None,
+                        help="Additional pool JSONL with long-answer records "
+                             "(e.g. from enrich_pool.py). Merged into main pool.")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility")
     args = parser.parse_args()
@@ -110,6 +113,22 @@ def main():
     print("  Sources:")
     for src, cnt in sorted(source_counts.items()):
         print(f"    {src}: {cnt}")
+
+    # Merge extra pool (long-answer enriched records)
+    if args.extra_pool:
+        extra_path = os.path.abspath(args.extra_pool)
+        print(f"\nLoading extra pool from {extra_path}")
+        extra = load_pool(extra_path)
+        print(f"  Loaded {len(extra)} extra records")
+        pool.extend(extra)
+        before = len(pool)
+        pool = exact_dedup(pool, key="question")
+        print(f"  After merge + dedup: {len(pool)} records "
+              f"(removed {before - len(pool)})")
+        source_counts = Counter(r["source"] for r in pool)
+        print("  Updated sources:")
+        for src, cnt in sorted(source_counts.items()):
+            print(f"    {src}: {cnt}")
 
     # Create output directory
     output_dir = os.path.abspath(args.output_dir)

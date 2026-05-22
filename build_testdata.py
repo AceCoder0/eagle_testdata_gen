@@ -120,7 +120,9 @@ def main():
         print(f"\nLoading extra pool from {extra_path}")
         extra = load_pool(extra_path)
         print(f"  Loaded {len(extra)} extra records")
-        pool.extend(extra)
+        # Prepend enriched records: exact_dedup keeps first occurrence,
+        # so enriched (long-answer) records win over originals
+        pool = extra + pool
         before = len(pool)
         pool = exact_dedup(pool, key="question")
         print(f"  After merge + dedup: {len(pool)} records "

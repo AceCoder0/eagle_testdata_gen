@@ -26,7 +26,9 @@ import time
 import random
 import argparse
 import hashlib
-from typing import List, Dict, Set, Optional
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import List, Dict, Set, Optional, Tuple, Any
 
 try:
     from urllib.request import Request, urlopen
@@ -119,6 +121,17 @@ def select_hard_problems(
         take = min(40, len(candidates))
         selected.extend(candidates[:take])
         print(f"  DAPO-Math-17k: {take} problems (random)")
+
+    # GSM8K (train) — top by answer_tokens as fallback to fill quota
+    if "gsm8k" in by_source:
+        candidates = sorted(
+            by_source["gsm8k"],
+            key=lambda r: r.get("answer_tokens", 0),
+            reverse=True,
+        )
+        take = min(50, len(candidates))
+        selected.extend(candidates[:take])
+        print(f"  GSM8K: {take} problems (by answer_tokens desc)")
 
     # Deduplicate by id (in case of cross-source overlap)
     seen: Set[str] = set()
@@ -280,8 +293,13 @@ def main():
                         help="Random seed for problem selection")
     parser.add_argument("--resume", type=str, default=None,
                         help="Resume from checkpoint JSON file")
-    parser.add_argument("--checkpoint_interval", type=int, default=10,
+    parser.add_argument("--checkpoint_interval", type=int, default=3,
                         help="Save checkpoint every N completed requests")
+    parser.add_argument("--workers", type=int, default=5,
+                        help="Number of concurrent API workers (default 5)")
+    parser.add_argument("--delay", type=float, default=2.0,
+                        help="Delay in seconds between API call submissions "
+                             "(to avoid rate limits)")
     args = parser.parse_args()
 
     # Read API key
@@ -290,13 +308,20 @@ def main():
     if not api_key:
         parser.error(f"API key file is empty: {args.api_key_file}")
 
+    # Ensure offline tokenizer loading (no HF hub calls)
+    os.environ.setdefault("HF_HUB_OFFLINE", "1")
+    os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
+
     rng = random.Random(args.seed)
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer_path, trust_remote_code=True)
+    print(f"Loading tokenizer from {args.tokenizer_path}...", flush=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.tokenizer_path, trust_remote_code=True, local_files_only=True)
+    print(f"  Tokenizer loaded.", flush=True)
 
     # Load pool
-    print(f"Loading pool from {args.pool}")
+    print(f"Loading pool from {args.pool}...", flush=True)
     pool = load_pool(args.pool)
-    print(f"  Loaded {len(pool)} records")
+    print(f"  Loaded {len(pool)} records", flush=True)
 
     # Handle resume
     completed: List[Dict] = []
@@ -324,85 +349,129 @@ def main():
     print(f"API: {args.api_base}  model: {args.model}")
     print(f"Temperature range: [{args.temperature_low}, {args.temperature_high}]")
     print(f"Checkpoint: {checkpoint_path} (every {args.checkpoint_interval})")
+    print(f"Workers: {args.workers} concurrent requests")
     print(f"Output: {args.output}\n")
 
-    # Process each problem
+    # Thread-safe print lock
+    print_lock = threading.Lock()
+
+    def process_one(rec: Dict) -> Tuple[Dict, Optional[str]]:
+        """Process a single problem: call API, return (enriched_record, error_msg)."""
+        q = rec["question"]
+        q_id = rec["id"]
+        src = rec.get("source", "?")
+        q_tokens = rec.get("question_tokens", 0)
+
+        # Jittered delay between API calls to avoid rate limits
+        if args.delay > 0:
+            jitter = rng.uniform(0, args.delay)
+            time.sleep(jitter)
+
+        temp = rng.uniform(args.temperature_low, args.temperature_high)
+
+        t0 = time.time()
+        try:
+            answer = call_minimax(
+                question=q,
+                api_key=api_key,
+                api_base=args.api_base,
+                model=args.model,
+                temperature=temp,
+                max_tokens=args.max_output_tokens,
+            )
+        except RuntimeError as e:
+            with print_lock:
+                print(f"  ERROR [{q_id}]: {e}")
+            return {}, str(e)
+
+        elapsed = time.time() - t0
+        a_tokens = len(tokenizer.encode(answer, add_special_tokens=False))
+        total_tokens = q_tokens + a_tokens
+
+        with print_lock:
+            print(f"  [{q_id}] {a_tokens} answer tokens ({len(answer)} chars) "
+                  f"in {elapsed:.1f}s (T={temp:.2f})")
+
+        enriched = {
+            "id": make_record_id(q_id, args.model),
+            "question": q,
+            "answer": answer,
+            "source": f"enriched_{src}",
+            "question_tokens": q_tokens,
+            "answer_tokens": a_tokens,
+            "total_tokens": total_tokens,
+            "original_id": q_id,
+            "generator_model": args.model,
+        }
+        return enriched, None
+
+    # Process with thread pool
+    completed_order: List[Dict] = []
+    errors = 0
+
     try:
-        for idx, rec in enumerate(remaining):
-            q = rec["question"]
-            q_id = rec["id"]
-            src = rec.get("source", "?")
-            q_tokens = rec.get("question_tokens", 0)
+        # Build a task list with index for ordering
+        tasks = list(enumerate(remaining))
+        task_idx = 0
 
-            # Vary temperature per request for answer diversity
-            temp = rng.uniform(args.temperature_low, args.temperature_high)
+        with ThreadPoolExecutor(max_workers=args.workers) as executor:
+            # Submit initial batch
+            futures: Dict[Any, Tuple[int, Dict]] = {}
+            for idx, rec in tasks[:args.workers]:
+                futures[executor.submit(process_one, rec)] = (idx, rec)
+            task_idx = args.workers
 
-            n = len(completed) + 1
-            print(f"[{n}/{total}] {q_id} ({src}, q={q_tokens}t, T={temp:.2f})")
-            print(f"  Q: {q[:120]}...")
+            while futures:
+                for future in as_completed(futures):
+                    idx, rec = futures.pop(future)
+                    enriched, err = future.result()
 
-            t0 = time.time()
-            try:
-                answer = call_minimax(
-                    question=q,
-                    api_key=api_key,
-                    api_base=args.api_base,
-                    model=args.model,
-                    temperature=temp,
-                    max_tokens=args.max_output_tokens,
-                )
-            except RuntimeError as e:
-                print(f"  ERROR: {e}")
-                print(f"  Saving checkpoint and aborting...")
-                save_checkpoint(checkpoint_path, completed, remaining[idx:],
-                                vars(args))
-                raise SystemExit(1)
+                    if err:
+                        errors += 1
+                        if errors > max(5, len(remaining) * 0.1):
+                            print(f"\nToo many errors ({errors}), aborting...")
+                            remaining_rest = [r for i, r in tasks if i >= idx]
+                            save_checkpoint(checkpoint_path, completed_order,
+                                            remaining_rest, vars(args))
+                            raise SystemExit(1)
+                    else:
+                        completed_order.append(enriched)
 
-            elapsed = time.time() - t0
+                    # Submit next task
+                    if task_idx < len(tasks):
+                        n_idx, n_rec = tasks[task_idx]
+                        futures[executor.submit(process_one, n_rec)] = (n_idx, n_rec)
+                        task_idx += 1
 
-            a_tokens = len(tokenizer.encode(answer, add_special_tokens=False))
-            total_tokens = q_tokens + a_tokens
-
-            print(f"  Generated: {a_tokens} answer tokens ({len(answer)} chars) "
-                  f"in {elapsed:.1f}s")
-
-            enriched = {
-                "id": make_record_id(q_id, args.model),
-                "question": q,
-                "answer": answer,
-                "source": f"enriched_{src}",
-                "question_tokens": q_tokens,
-                "answer_tokens": a_tokens,
-                "total_tokens": total_tokens,
-                "original_id": q_id,
-                "generator_model": args.model,
-            }
-            completed.append(enriched)
-
-            # Periodic checkpoint
-            if len(completed) % args.checkpoint_interval == 0:
-                save_checkpoint(checkpoint_path, completed,
-                                remaining[idx + 1:], vars(args))
-                print(f"  [Checkpoint saved: {len(completed)} completed]")
+                    # Periodic checkpoint
+                    if len(completed_order) % args.checkpoint_interval == 0 and completed_order:
+                        remaining_rest = [r for i, r in tasks if i >= task_idx]
+                        save_checkpoint(checkpoint_path, completed_order,
+                                        remaining_rest, vars(args))
+                        with print_lock:
+                            print(f"  [Checkpoint: {len(completed_order)}/{total} completed, "
+                                  f"{errors} errors]")
 
     except KeyboardInterrupt:
         print(f"\nInterrupted. Saving checkpoint...")
-        save_checkpoint(checkpoint_path, completed,
-                        remaining[idx:], vars(args))
+        remaining_rest = [r for i, r in tasks if i >= task_idx]
+        save_checkpoint(checkpoint_path, completed_order, remaining_rest, vars(args))
         print(f"Resume later with: --resume {checkpoint_path}")
         raise SystemExit(0)
 
     # Save final output
-    save_records(completed, args.output)
+    save_records(completed_order, args.output)
 
     # Print stats
-    answer_lens = [r["answer_tokens"] for r in completed]
-    print(f"\nDone. {len(completed)} records saved to {args.output}")
-    print(f"  Answer tokens: min={min(answer_lens)}, max={max(answer_lens)}, "
-          f"mean={sum(answer_lens) // len(answer_lens)}")
+    answer_lens = [r["answer_tokens"] for r in completed_order]
+    print(f"\nDone. {len(completed_order)} records saved to {args.output} "
+          f"({errors} errors)")
+    if answer_lens:
+        print(f"  Answer tokens: min={min(answer_lens)}, max={max(answer_lens)}, "
+              f"mean={sum(answer_lens) // len(answer_lens)}")
     print(f"  Sources:")
     from collections import Counter
-    src_counts = Counter(r["source"] for r in completed)
+    src_counts = Counter(r["source"] for r in completed_order)
     for s, c in sorted(src_counts.items()):
         print(f"    {s}: {c}")
 

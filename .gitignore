@@ -1,4 +1,6 @@
 math_pool.jsonl
+math_pool_enriched.jsonl
+math_pool_enriched.jsonl.checkpoint.json
 output/
 *.png
 __pycache__/

@@ -237,9 +237,12 @@ class FewShotBuilder:
                 break
             results.append(record)
 
-        # Cross-prompt dedup of final questions
-        from dedup import cross_prompt_dedup
-        results = cross_prompt_dedup(results, key="final_question")
+        # Cross-prompt dedup of final questions.
+        # Skip when filtered pool is smaller than samples — allows
+        # cycling through the same records to meet the requested count.
+        if len(self.pool) >= num_samples:
+            from dedup import cross_prompt_dedup
+            results = cross_prompt_dedup(results, key="final_question")
 
         return results
 
@@ -409,8 +412,10 @@ class FewShotBuilder:
                 "batch_id": batch_id,
             })
 
-        # Cross-prompt dedup of final questions
-        from dedup import cross_prompt_dedup
-        results = cross_prompt_dedup(results, key="final_question")
+        # Cross-prompt dedup of final questions.
+        # Skip when filtered pool is smaller than samples.
+        if len(self.pool) >= num_samples:
+            from dedup import cross_prompt_dedup
+            results = cross_prompt_dedup(results, key="final_question")
 
         return results

@@ -45,7 +45,12 @@ class FewShotBuilder:
         self.rng = random.Random(seed)
         self.answer_style = answer_style
 
-        # Filter pool by minimum answer token length
+        # Full pool for exemplar selection (always unfiltered, for tight
+        # input length control with varied-size Q&A pairs).
+        self._exemplar_pool = list(pool)
+
+        # Filtered pool for final question selection (guided by
+        # min_answer_tokens to steer output length).
         if min_answer_tokens > 0:
             self.pool = [r for r in pool if r.get("answer_tokens", 0) >= min_answer_tokens]
             if len(self.pool) == 0:
@@ -56,7 +61,7 @@ class FewShotBuilder:
         else:
             self.pool = list(pool)
 
-        # Pre-compute formatted token counts for each pool entry
+        # Pre-compute QA token counts for filtered pool (final questions)
         self._qa_tokens: Dict[str, int] = {}
         self._q_only_tokens: Dict[str, int] = {}
         for r in self.pool:
@@ -70,11 +75,20 @@ class FewShotBuilder:
                 tokenizer,
             )
 
+        # Pre-compute QA token counts for full pool (exemplars)
+        self._exemplar_qa_tokens: Dict[str, int] = {}
+        for r in self._exemplar_pool:
+            rid = r["id"]
+            self._exemplar_qa_tokens[rid] = _format_count(
+                QA_TEMPLATE.format(question=r["question"], answer=r["answer"]),
+                tokenizer,
+            )
+
         self.instruction_tokens = _format_count(INSTRUCTION, tokenizer)
 
-        # Group pool by source for stratified sampling
+        # Group exemplar pool by source for stratified sampling
         self._by_source: Dict[str, List[Dict]] = {}
-        for r in self.pool:
+        for r in self._exemplar_pool:
             src = r.get("source", "unknown")
             self._by_source.setdefault(src, []).append(r)
 
@@ -99,8 +113,8 @@ class FewShotBuilder:
             if candidates:
                 return self._pick_by_style(candidates)
 
-        # Fallback: any unused record
-        candidates = [r for r in self.pool if r["id"] not in used_ids]
+        # Fallback: any unused record from full exemplar pool
+        candidates = [r for r in self._exemplar_pool if r["id"] not in used_ids]
         if candidates:
             return self._pick_by_style(candidates)
         return None
@@ -152,14 +166,14 @@ class FewShotBuilder:
         # Phase 1: Greedy packing to fill budget
         budget = remaining
         attempts = 0
-        max_attempts = len(self.pool) * 2
+        max_attempts = len(self._exemplar_pool) * 2
 
         while budget > (target_tokens * tolerance) and attempts < max_attempts:
             candidate = self._pick_stratified(used_in_prompt, set())
             if candidate is None:
                 break
 
-            qa_tok = self._qa_tokens[candidate["id"]]
+            qa_tok = self._exemplar_qa_tokens[candidate["id"]]
             if qa_tok <= budget + (target_tokens * tolerance * 0.5):
                 exemplars.append((candidate, qa_tok))
                 budget -= qa_tok
@@ -167,26 +181,34 @@ class FewShotBuilder:
                 used_sources.add(candidate.get("source", "unknown"))
             attempts += 1
 
-        # Phase 2: If below min_qa_pairs, force-add from remaining pool
+        # Phase 2: If below min_qa_pairs, force-add smallest available
+        # exemplars from the FULL pool (not filtered) to minimize
+        # overshoot and keep input length tightly controlled.
         while len(exemplars) < min_qa_pairs:
-            candidates = [r for r in self.pool if r["id"] not in used_in_prompt]
+            candidates = [r for r in self._exemplar_pool if r["id"] not in used_in_prompt]
             if not candidates:
                 break
-            c = self._pick_by_style(candidates)
-            qa_tok = self._qa_tokens[c["id"]]
+            candidates.sort(key=lambda r: self._exemplar_qa_tokens.get(r["id"], 0))
+            c = candidates[0]
+            qa_tok = self._exemplar_qa_tokens[c["id"]]
+            # Don't force-add if even the smallest exemplar would push us
+            # beyond the upper tolerance bound — accept fewer exemplars.
+            current_total = self.instruction_tokens + sum(t for _, t in exemplars) + final_q_tokens
+            if current_total + qa_tok > upper_bound:
+                break
             exemplars.append((c, qa_tok))
             budget -= qa_tok
             used_in_prompt.add(c["id"])
             used_sources.add(c.get("source", "unknown"))
 
-        # Phase 3: Fill remaining budget with small Q&A pairs
+        # Phase 3: Fill remaining budget with small Q&A pairs from full pool
         if budget > 0:
             small_candidates = sorted(
-                [r for r in self.pool if r["id"] not in used_in_prompt],
-                key=lambda r: self._qa_tokens.get(r["id"], 0),
+                [r for r in self._exemplar_pool if r["id"] not in used_in_prompt],
+                key=lambda r: self._exemplar_qa_tokens.get(r["id"], 0),
             )
             for c in small_candidates:
-                qa_tok = self._qa_tokens[c["id"]]
+                qa_tok = self._exemplar_qa_tokens[c["id"]]
                 if qa_tok <= budget:
                     exemplars.append((c, qa_tok))
                     budget -= qa_tok
@@ -264,27 +286,27 @@ class FewShotBuilder:
         used: Set[str] = set(exclude_ids)
         remaining = budget
         attempts = 0
-        max_attempts = len(self.pool) * 2
+        max_attempts = len(self._exemplar_pool) * 2
 
         while remaining > (target_tokens * tolerance) and attempts < max_attempts:
             candidate = self._pick_stratified(used, set())
             if candidate is None:
                 break
-            qa_tok = self._qa_tokens[candidate["id"]]
+            qa_tok = self._exemplar_qa_tokens[candidate["id"]]
             if qa_tok <= remaining + (target_tokens * tolerance * 0.5):
                 exemplars.append((candidate, qa_tok))
                 remaining -= qa_tok
                 used.add(candidate["id"])
             attempts += 1
 
-        # Fill remaining gaps with small Q&A pairs
+        # Fill remaining gaps with small Q&A pairs from full pool
         if remaining > 0:
             small = sorted(
-                [r for r in self.pool if r["id"] not in used],
-                key=lambda r: self._qa_tokens.get(r["id"], 0),
+                [r for r in self._exemplar_pool if r["id"] not in used],
+                key=lambda r: self._exemplar_qa_tokens.get(r["id"], 0),
             )
             for c in small:
-                qa_tok = self._qa_tokens[c["id"]]
+                qa_tok = self._exemplar_qa_tokens[c["id"]]
                 if qa_tok <= remaining:
                     exemplars.append((c, qa_tok))
                     remaining -= qa_tok
@@ -377,17 +399,24 @@ class FewShotBuilder:
                 max(unique_budget, 1), exclude, tolerance, target_tokens
             )
 
-            # Ensure minimum Q&A pairs in unique suffix
+            # Ensure minimum Q&A pairs in unique suffix.
+            # Pick smallest exemplars from FULL pool to minimize overshoot.
             while len(unique_exemplars) < min_qa_pairs:
                 candidates = [
-                    r for r in self.pool
+                    r for r in self._exemplar_pool
                     if r["id"] not in exclude
                     and r["id"] not in {rec["id"] for rec, _ in unique_exemplars}
                 ]
                 if not candidates:
                     break
-                c = self._pick_by_style(candidates)
-                qa_tok = self._qa_tokens[c["id"]]
+                candidates.sort(key=lambda r: self._exemplar_qa_tokens.get(r["id"], 0))
+                c = candidates[0]
+                qa_tok = self._exemplar_qa_tokens[c["id"]]
+                # Don't force-add if the smallest exemplar would overshoot
+                # beyond the tolerance bound
+                full_tok = common_text_tokens + sum(t for _, t in unique_exemplars) + final_q_tokens
+                if full_tok + qa_tok > target_tokens * (1 + tolerance):
+                    break
                 unique_exemplars.append((c, qa_tok))
                 exclude.add(c["id"])
 

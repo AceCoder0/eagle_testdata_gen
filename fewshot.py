@@ -119,6 +119,77 @@ class FewShotBuilder:
             return self._pick_by_style(candidates)
         return None
 
+    def _local_search(
+        self,
+        exemplars: List[Tuple[Dict, int]],
+        target_tokens: int,
+        final_q_tokens: int,
+        tolerance: float,
+        used_ids: Set[str],
+    ) -> List[Tuple[Dict, int]]:
+        """Phase 4: Hill-climbing to minimize |actual - target|.
+
+        Tries removing exemplars (to fix overshoot) or swapping exemplars
+        for better-fit unused ones. Repeated until no improvement.
+        """
+        def _total(exs):
+            return self.instruction_tokens + sum(t for _, t in exs) + final_q_tokens
+
+        current_total = _total(exemplars)
+        best_error = abs(current_total - target_tokens)
+        best_exs = list(exemplars)
+
+        if best_error == 0:
+            return best_exs
+
+        # Build sorted candidate pool from unused exemplars
+        available = sorted(
+            [(r, self._exemplar_qa_tokens[r["id"]])
+             for r in self._exemplar_pool
+             if r["id"] not in used_ids],
+            key=lambda x: x[1],
+        )
+
+        improved = True
+        max_iter = 10
+        while improved and max_iter > 0:
+            improved = False
+            max_iter -= 1
+
+            # Strategy 1: Remove one exemplar (helps with overshoot)
+            for i, (rec, tok) in enumerate(best_exs):
+                new_total = current_total - tok
+                new_error = abs(new_total - target_tokens)
+                if new_error < best_error:
+                    best_exs.pop(i)
+                    current_total = new_total
+                    best_error = new_error
+                    improved = True
+                    break
+
+            if improved:
+                continue
+
+            # Strategy 2: Swap one exemplar for a better-fit unused one
+            for i, (rec, tok) in enumerate(best_exs):
+                for cand_rec, cand_tok in available:
+                    if cand_rec["id"] in {r["id"] for r, _ in best_exs}:
+                        continue
+                    new_total = current_total - tok + cand_tok
+                    new_error = abs(new_total - target_tokens)
+                    if new_error < best_error:
+                        best_exs[i] = (cand_rec, cand_tok)
+                        current_total = new_total
+                        best_error = new_error
+                        improved = True
+                        # Remove used candidate from available
+                        available = [(r, t) for r, t in available if r["id"] != cand_rec["id"]]
+                        break
+                if improved:
+                    break
+
+        return best_exs
+
     def build_one(
         self,
         target_tokens: int,
@@ -215,6 +286,12 @@ class FewShotBuilder:
                     used_in_prompt.add(c["id"])
                     if budget <= 0:
                         break
+
+        # Phase 4: Local search to minimize |actual - target|
+        exemplars = self._local_search(
+            exemplars, target_tokens, final_q_tokens,
+            tolerance, used_in_prompt,
+        )
 
         # Assemble the prompt
         self.rng.shuffle(exemplars)
